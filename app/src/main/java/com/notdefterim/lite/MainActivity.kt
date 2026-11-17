@@ -593,7 +593,7 @@ class MainActivity : ComponentActivity() {
                         modifier = Modifier
                             .align(Alignment.CenterEnd)
                             .fillMaxHeight()
-                            .padding(vertical = 16.dp, end = 4.dp)
+                            .padding(top = 16.dp, bottom = 16.dp, end = 4.dp)
                             .width(32.dp)
                     ) {
                         val density = LocalDensity.current
