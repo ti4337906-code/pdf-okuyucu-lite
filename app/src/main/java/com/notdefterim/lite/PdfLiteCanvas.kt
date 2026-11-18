@@ -77,6 +77,7 @@ class PdfReaderView(context: Context) : View(context) {
     var onActivePageChanged: ((Int) -> Unit)? = null
     var onScrollFractionChanged: ((Float) -> Unit)? = null
     var onZoomChanged: ((Float) -> Unit)? = null
+    var onSingleTap: (() -> Unit)? = null
 
     private var zoomFactor = 1f
     private var panX = 0f
@@ -138,6 +139,14 @@ class PdfReaderView(context: Context) : View(context) {
     })
 
     private val gestureDetector = GestureDetector(context, object : GestureDetector.SimpleOnGestureListener() {
+        override fun onSingleTapConfirmed(e: MotionEvent): Boolean {
+            if (!drawEnabled) {
+                onSingleTap?.invoke()
+                return true
+            }
+            return false
+        }
+
         override fun onDoubleTap(e: MotionEvent): Boolean {
             if (drawEnabled) return false
             val target = if (zoomFactor > 1.3f) 1f else 2.2f
@@ -478,6 +487,7 @@ fun PdfReaderCanvas(
     onActivePageChanged: (Int) -> Unit,
     onScrollFractionChanged: (Float) -> Unit,
     onZoomChanged: (Float) -> Unit,
+    onSingleTap: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     AndroidView(
@@ -489,6 +499,7 @@ fun PdfReaderCanvas(
                 this.onActivePageChanged = onActivePageChanged
                 this.onScrollFractionChanged = onScrollFractionChanged
                 this.onZoomChanged = onZoomChanged
+                this.onSingleTap = onSingleTap
             }
         },
         update = { view ->
@@ -509,6 +520,7 @@ fun PdfReaderCanvas(
             view.onActivePageChanged = onActivePageChanged
             view.onScrollFractionChanged = onScrollFractionChanged
             view.onZoomChanged = onZoomChanged
+            view.onSingleTap = onSingleTap
 
             val tags = (view.tag as? IntArray) ?: intArrayOf(0, 0, 0)
             if (jumpTrigger > 0 && tags[0] != jumpTrigger) view.jumpToPage(jumpTargetPage, jumpTargetRect)

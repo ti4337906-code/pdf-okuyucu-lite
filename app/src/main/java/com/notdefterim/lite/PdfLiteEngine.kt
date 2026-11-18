@@ -32,7 +32,8 @@ data class RecentPdfItem(
     val openedAtMs: Long,
     val lastPage: Int = 0,
     val fileSizeBytes: Long = 0L,
-    val folder: String = ""
+    val folder: String = "",
+    val isFavorite: Boolean = false
 )
 
 data class ImportResult(
@@ -707,10 +708,27 @@ object PdfLiteEngine {
             item.copy(
                 lastPage = prev?.lastPage ?: item.lastPage,
                 folder = if (item.folder.isNotEmpty()) item.folder else (prev?.folder ?: ""),
-                fileSizeBytes = if (item.fileSizeBytes > 0L) item.fileSizeBytes else (prev?.fileSizeBytes ?: File(item.path).length())
+                fileSizeBytes = if (item.fileSizeBytes > 0L) item.fileSizeBytes else (prev?.fileSizeBytes ?: File(item.path).length()),
+                isFavorite = prev?.isFavorite ?: item.isFavorite
             )
         )
         writeRecents(context, list.take(50))
+    }
+
+    fun renamePdf(context: Context, pdfPath: String, newTitle: String) {
+        val clean = newTitle.trim().replace(Regex("[\\\\/:*?\"<>|\\p{Cntrl}]"), "_")
+        if (clean.isBlank()) return
+        val list = loadRecents(context).map {
+            if (it.path == pdfPath) it.copy(title = clean) else it
+        }
+        writeRecents(context, list)
+    }
+
+    fun toggleFavorite(context: Context, pdfPath: String) {
+        val list = loadRecents(context).map {
+            if (it.path == pdfPath) it.copy(isFavorite = !it.isFavorite) else it
+        }
+        writeRecents(context, list)
     }
 
     fun setPdfFolder(context: Context, pdfPath: String, folder: String) {
@@ -759,6 +777,7 @@ object PdfLiteEngine {
             o.put("lp", r.lastPage)
             o.put("sz", r.fileSizeBytes)
             o.put("fd", r.folder)
+            o.put("fav", r.isFavorite)
             arr.put(o)
         }
         context.getSharedPreferences("lite_prefs", Context.MODE_PRIVATE)
@@ -782,7 +801,8 @@ object PdfLiteEngine {
                     openedAtMs = o.getLong("ts"),
                     lastPage = o.optInt("lp", 0),
                     fileSizeBytes = sz,
-                    folder = o.optString("fd", "")
+                    folder = o.optString("fd", ""),
+                    isFavorite = o.optBoolean("fav", false)
                 )
             }.filter { File(it.path).exists() }
         } catch (_: Exception) { emptyList() }
