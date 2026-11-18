@@ -12,6 +12,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -36,16 +37,20 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -57,12 +62,17 @@ private val LITE_BORDER = Color(0xFF27272A)
 private val PDF_RED = Color(0xFFDC2626)
 private val HONOR_BLUE = Color(0xFF3B82F6)
 
+private enum class SortMode(val label: String) {
+    RECENT("Son Açılan / Tarih"),
+    SIZE("Dosya Boyutu"),
+    ALPHA("Alfabetik (A–Z)")
+}
+
 class MainActivity : ComponentActivity() {
     private var incomingPdfUri by mutableStateOf<Uri?>(null)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        // Lock to highest refresh rate (120Hz on Honor 400)
         try {
             val disp = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) display else @Suppress("DEPRECATION") windowManager.defaultDisplay
             val best = disp?.supportedModes?.maxByOrNull { it.refreshRate }
@@ -101,22 +111,32 @@ class MainActivity : ComponentActivity() {
     @Composable
     private fun LiteAppRoot() {
         val scope = rememberCoroutineScope()
-        var openPdf by remember { mutableStateOf<Pair<String, String>?>(null) } // path to title
+        var openPdf by remember { mutableStateOf<Pair<String, String>?>(null) }
         var recents by remember { mutableStateOf(PdfLiteEngine.loadRecents(this)) }
+        var folders by remember { mutableStateOf(PdfLiteEngine.loadFolders(this)) }
 
         LaunchedEffect(incomingPdfUri) {
             val uri = incomingPdfUri ?: return@LaunchedEffect
             val imported = withContext(Dispatchers.IO) { PdfLiteEngine.importPdfUri(this@MainActivity, uri) }
             if (imported != null) {
-                val meta = withContext(Dispatchers.IO) { PdfLiteEngine.getOrBuildMeta(this@MainActivity, imported.first) }
+                if (imported.isLargeFile) {
+                    Toast.makeText(this@MainActivity, "Büyük dosya (>300 MB) — optimizasyon biraz sürebilir", Toast.LENGTH_LONG).show()
+                }
+                val meta = withContext(Dispatchers.IO) { PdfLiteEngine.getOrBuildMeta(this@MainActivity, imported.path) }
                 withContext(Dispatchers.IO) {
                     PdfLiteEngine.saveRecent(
                         this@MainActivity,
-                        RecentPdfItem(imported.second, imported.first, meta.pageCount, System.currentTimeMillis())
+                        RecentPdfItem(
+                            title = imported.title,
+                            path = imported.path,
+                            pageCount = meta.pageCount,
+                            openedAtMs = System.currentTimeMillis(),
+                            fileSizeBytes = imported.fileSizeBytes
+                        )
                     )
                 }
                 recents = PdfLiteEngine.loadRecents(this@MainActivity)
-                openPdf = imported
+                openPdf = imported.path to imported.title
             } else {
                 Toast.makeText(this@MainActivity, "Geçersiz veya desteklenmeyen PDF reddedildi", Toast.LENGTH_LONG).show()
             }
@@ -128,15 +148,26 @@ class MainActivity : ComponentActivity() {
             scope.launch {
                 val imported = withContext(Dispatchers.IO) { PdfLiteEngine.importPdfUri(this@MainActivity, uri) }
                 if (imported != null) {
-                    val meta = withContext(Dispatchers.IO) { PdfLiteEngine.getOrBuildMeta(this@MainActivity, imported.first) }
+                    if (imported.isLargeFile) {
+                        Toast.makeText(this@MainActivity, "Büyük dosya (>300 MB) — optimizasyon biraz sürebilir", Toast.LENGTH_LONG).show()
+                    }
+                    val meta = withContext(Dispatchers.IO) { PdfLiteEngine.getOrBuildMeta(this@MainActivity, imported.path) }
                     withContext(Dispatchers.IO) {
                         PdfLiteEngine.saveRecent(
                             this@MainActivity,
-                            RecentPdfItem(imported.second, imported.first, meta.pageCount, System.currentTimeMillis())
+                            RecentPdfItem(
+                                title = imported.title,
+                                path = imported.path,
+                                pageCount = meta.pageCount,
+                                openedAtMs = System.currentTimeMillis(),
+                                fileSizeBytes = imported.fileSizeBytes
+                            )
                         )
                     }
                     recents = PdfLiteEngine.loadRecents(this@MainActivity)
-                    openPdf = imported
+                    openPdf = imported.path to imported.title
+                } else {
+                    Toast.makeText(this@MainActivity, "Geçersiz veya desteklenmeyen PDF reddedildi", Toast.LENGTH_LONG).show()
                 }
             }
         }
@@ -145,8 +176,34 @@ class MainActivity : ComponentActivity() {
         if (active == null) {
             HomeScreen(
                 recents = recents,
+                folders = folders,
                 onPickPdf = { picker.launch(arrayOf("application/pdf")) },
-                onOpenRecent = { item -> openPdf = item.path to item.title }
+                onOpenRecent = { item ->
+                    scope.launch(Dispatchers.IO) {
+                        PdfLiteEngine.saveRecent(this@MainActivity, item.copy(openedAtMs = System.currentTimeMillis()))
+                    }
+                    openPdf = item.path to item.title
+                },
+                onDeletePdf = { item ->
+                    scope.launch {
+                        withContext(Dispatchers.IO) { PdfLiteEngine.deletePdf(this@MainActivity, item.path) }
+                        recents = PdfLiteEngine.loadRecents(this@MainActivity)
+                    }
+                },
+                onMoveToFolder = { item, folder ->
+                    PdfLiteEngine.setPdfFolder(this@MainActivity, item.path, folder)
+                    recents = PdfLiteEngine.loadRecents(this@MainActivity)
+                },
+                onCreateFolder = { name ->
+                    folders = PdfLiteEngine.addFolder(this@MainActivity, name)
+                },
+                onDeleteFolder = { name ->
+                    folders = PdfLiteEngine.deleteFolder(this@MainActivity, name)
+                    recents = PdfLiteEngine.loadRecents(this@MainActivity)
+                },
+                onRefreshRecents = {
+                    recents = PdfLiteEngine.loadRecents(this@MainActivity)
+                }
             )
         } else {
             ReaderScreen(
@@ -164,9 +221,205 @@ class MainActivity : ComponentActivity() {
     @Composable
     private fun HomeScreen(
         recents: List<RecentPdfItem>,
+        folders: List<String>,
         onPickPdf: () -> Unit,
-        onOpenRecent: (RecentPdfItem) -> Unit
+        onOpenRecent: (RecentPdfItem) -> Unit,
+        onDeletePdf: (RecentPdfItem) -> Unit,
+        onMoveToFolder: (RecentPdfItem, String) -> Unit,
+        onCreateFolder: (String) -> Unit,
+        onDeleteFolder: (String) -> Unit,
+        onRefreshRecents: () -> Unit
     ) {
+        val scope = rememberCoroutineScope()
+        var sortMode by remember { mutableStateOf(SortMode.RECENT) }
+        var sortReversed by remember { mutableStateOf(false) }
+        var showSortMenu by remember { mutableStateOf(false) }
+
+        var selectedFolder by remember { mutableStateOf<String?>(null) }
+        var showNewFolderDialog by remember { mutableStateOf(false) }
+        var newFolderName by remember { mutableStateOf("") }
+
+        var moveTargetItem by remember { mutableStateOf<RecentPdfItem?>(null) }
+        var deleteTargetItem by remember { mutableStateOf<RecentPdfItem?>(null) }
+
+        var showMergeDialog by remember { mutableStateOf(false) }
+        var mergeSelection by remember { mutableStateOf<List<String>>(emptyList()) }
+        var mergeTitle by remember { mutableStateOf("Birlesik_PDF") }
+        var isMerging by remember { mutableStateOf(false) }
+
+        val displayedList = remember(recents, selectedFolder, sortMode, sortReversed) {
+            val filtered = if (selectedFolder == null) recents else recents.filter { it.folder == selectedFolder }
+            val sorted = when (sortMode) {
+                SortMode.RECENT -> filtered.sortedByDescending { it.openedAtMs }
+                SortMode.SIZE -> filtered.sortedByDescending { it.fileSizeBytes }
+                SortMode.ALPHA -> filtered.sortedBy { it.title.lowercase(java.util.Locale("tr", "TR")) }
+            }
+            if (sortReversed) sorted.reversed() else sorted
+        }
+
+        if (showNewFolderDialog) {
+            AlertDialog(
+                onDismissRequest = { showNewFolderDialog = false },
+                containerColor = LITE_CARD,
+                title = { Text("Yeni Klasör", color = Color.White, fontSize = 16.sp) },
+                text = {
+                    OutlinedTextField(
+                        value = newFolderName,
+                        onValueChange = { newFolderName = it },
+                        label = { Text("Klasör adı") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                },
+                confirmButton = {
+                    TextButton(onClick = {
+                        if (newFolderName.isNotBlank()) onCreateFolder(newFolderName)
+                        newFolderName = ""
+                        showNewFolderDialog = false
+                    }) { Text("Oluştur", color = HONOR_BLUE, fontWeight = FontWeight.Bold) }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showNewFolderDialog = false }) { Text("İptal", color = Color(0xFFA1A1AA)) }
+                }
+            )
+        }
+
+        moveTargetItem?.let { item ->
+            AlertDialog(
+                onDismissRequest = { moveTargetItem = null },
+                containerColor = LITE_CARD,
+                title = { Text("Klasöre Taşı", color = Color.White, fontSize = 16.sp) },
+                text = {
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text(item.title, color = Color(0xFFA1A1AA), fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Surface(
+                            shape = RoundedCornerShape(8.dp),
+                            color = if (item.folder.isEmpty()) HONOR_BLUE.copy(alpha = 0.2f) else LITE_BG,
+                            modifier = Modifier.fillMaxWidth().clickable {
+                                onMoveToFolder(item, "")
+                                moveTargetItem = null
+                            }
+                        ) {
+                            Text("Klasörsüz (Tümü)", color = Color.White, fontSize = 13.sp, modifier = Modifier.padding(12.dp))
+                        }
+                        folders.forEach { f ->
+                            Surface(
+                                shape = RoundedCornerShape(8.dp),
+                                color = if (item.folder == f) HONOR_BLUE.copy(alpha = 0.2f) else LITE_BG,
+                                modifier = Modifier.fillMaxWidth().clickable {
+                                    onMoveToFolder(item, f)
+                                    moveTargetItem = null
+                                }
+                            ) {
+                                Text(f, color = Color.White, fontSize = 13.sp, modifier = Modifier.padding(12.dp))
+                            }
+                        }
+                    }
+                },
+                confirmButton = {
+                    TextButton(onClick = { moveTargetItem = null }) { Text("Kapat", color = Color(0xFFA1A1AA)) }
+                }
+            )
+        }
+
+        deleteTargetItem?.let { item ->
+            AlertDialog(
+                onDismissRequest = { deleteTargetItem = null },
+                containerColor = LITE_CARD,
+                title = { Text("PDF Silinsin mi?", color = Color.White, fontSize = 16.sp) },
+                text = { Text("'${item.title}' ve önbelleği uygulamadan silinecek.", color = Color(0xFFA1A1AA), fontSize = 13.sp) },
+                confirmButton = {
+                    TextButton(onClick = {
+                        onDeletePdf(item)
+                        deleteTargetItem = null
+                    }) { Text("Sil", color = PDF_RED, fontWeight = FontWeight.Bold) }
+                },
+                dismissButton = {
+                    TextButton(onClick = { deleteTargetItem = null }) { Text("İptal", color = Color(0xFFA1A1AA)) }
+                }
+            )
+        }
+
+        if (showMergeDialog) {
+            AlertDialog(
+                onDismissRequest = { if (!isMerging) showMergeDialog = false },
+                containerColor = LITE_CARD,
+                title = { Text("PDF Birleştir", color = Color.White, fontSize = 16.sp) },
+                text = {
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedTextField(
+                            value = mergeTitle,
+                            onValueChange = { mergeTitle = it },
+                            label = { Text("Yeni PDF adı") },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        Text("Birleştirilecek PDF'leri sırayla seç (en az 2):", color = Color(0xFFA1A1AA), fontSize = 12.sp)
+                        LazyColumn(modifier = Modifier.heightIn(max = 220.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            items(recents, key = { it.path }) { item ->
+                                val orderIdx = mergeSelection.indexOf(item.path)
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clip(RoundedCornerShape(8.dp))
+                                        .background(if (orderIdx >= 0) HONOR_BLUE.copy(alpha = 0.18f) else LITE_BG)
+                                        .clickable {
+                                            mergeSelection = if (orderIdx >= 0) mergeSelection - item.path else mergeSelection + item.path
+                                        }
+                                        .padding(10.dp)
+                                ) {
+                                    Text(
+                                        if (orderIdx >= 0) "${orderIdx + 1}." else "○",
+                                        color = if (orderIdx >= 0) HONOR_BLUE else Color(0xFF71717A),
+                                        fontWeight = FontWeight.Bold,
+                                        fontSize = 13.sp
+                                    )
+                                    Text(item.title, color = Color.White, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                                }
+                            }
+                        }
+                    }
+                },
+                confirmButton = {
+                    TextButton(
+                        enabled = mergeSelection.size >= 2 && !isMerging,
+                        onClick = {
+                            isMerging = true
+                            scope.launch {
+                                val res = withContext(Dispatchers.IO) {
+                                    PdfLiteEngine.mergePdfs(this@MainActivity, mergeSelection, mergeTitle)
+                                }
+                                if (res != null) {
+                                    val imp = withContext(Dispatchers.IO) { PdfLiteEngine.importPdfUri(this@MainActivity, res.first) }
+                                    if (imp != null) {
+                                        val meta = withContext(Dispatchers.IO) { PdfLiteEngine.getOrBuildMeta(this@MainActivity, imp.path) }
+                                        withContext(Dispatchers.IO) {
+                                            PdfLiteEngine.saveRecent(
+                                                this@MainActivity,
+                                                RecentPdfItem(imp.title, imp.path, meta.pageCount, System.currentTimeMillis(), fileSizeBytes = imp.fileSizeBytes)
+                                            )
+                                        }
+                                        onRefreshRecents()
+                                    }
+                                    Toast.makeText(this@MainActivity, "'${res.second}' İndirilenlere kaydedildi!", Toast.LENGTH_LONG).show()
+                                } else {
+                                    Toast.makeText(this@MainActivity, "Birleştirme başarısız", Toast.LENGTH_SHORT).show()
+                                }
+                                isMerging = false
+                                showMergeDialog = false
+                                mergeSelection = emptyList()
+                            }
+                        }
+                    ) { Text(if (isMerging) "Birleştiriliyor..." else "Birleştir", color = PDF_RED, fontWeight = FontWeight.Bold) }
+                },
+                dismissButton = {
+                    TextButton(enabled = !isMerging, onClick = { showMergeDialog = false }) { Text("İptal", color = Color(0xFFA1A1AA)) }
+                }
+            )
+        }
+
         Scaffold(
             containerColor = LITE_BG,
             topBar = {
@@ -174,12 +427,43 @@ class MainActivity : ComponentActivity() {
                     colors = TopAppBarDefaults.topAppBarColors(containerColor = LITE_BG, titleContentColor = Color.White),
                     title = {
                         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                            Surface(shape = RoundedCornerShape(8.dp), color = PDF_RED, modifier = Modifier.size(30.dp)) {
-                                Box(contentAlignment = Alignment.Center) {
-                                    Text("PDF", fontSize = 10.sp, fontWeight = FontWeight.ExtraBold, color = Color.White)
+                            Box(
+                                modifier = Modifier.size(30.dp).clip(RoundedCornerShape(8.dp)).background(PDF_RED),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text("PDF", fontSize = 10.sp, fontWeight = FontWeight.ExtraBold, color = Color.White)
+                            }
+                            Text("PDF Okuyucu Lite", fontWeight = FontWeight.Bold, fontSize = 17.sp)
+                        }
+                    },
+                    actions = {
+                        if (recents.size >= 2) {
+                            IconButton(onClick = { mergeSelection = emptyList(); showMergeDialog = true }) {
+                                Icon(Icons.Default.CallMerge, contentDescription = "PDF Birleştir", tint = Color.White)
+                            }
+                        }
+                        Box {
+                            IconButton(onClick = { showSortMenu = true }) {
+                                Icon(Icons.Default.Sort, contentDescription = "Sırala", tint = Color.White)
+                            }
+                            DropdownMenu(expanded = showSortMenu, onDismissRequest = { showSortMenu = false }, modifier = Modifier.background(LITE_CARD)) {
+                                SortMode.entries.forEach { m ->
+                                    DropdownMenuItem(
+                                        text = { Text(m.label, color = if (sortMode == m) HONOR_BLUE else Color.White) },
+                                        onClick = {
+                                            if (sortMode == m) sortReversed = !sortReversed else { sortMode = m; sortReversed = false }
+                                            showSortMenu = false
+                                        }
+                                    )
                                 }
                             }
-                            Text("PDF Okuyucu Lite", fontWeight = FontWeight.Bold, fontSize = 19.sp)
+                        }
+                        IconButton(onClick = { sortReversed = !sortReversed }) {
+                            Icon(
+                                imageVector = if (sortReversed) Icons.Default.ArrowUpward else Icons.Default.ArrowDownward,
+                                contentDescription = "Sırayı Ters Çevir",
+                                tint = Color(0xFFA1A1AA)
+                            )
                         }
                     }
                 )
@@ -190,7 +474,7 @@ class MainActivity : ComponentActivity() {
                     containerColor = PDF_RED,
                     contentColor = Color.White,
                     icon = { Icon(Icons.Default.FolderOpen, contentDescription = null) },
-                    text = { Text("PDF Aç", fontWeight = FontWeight.SemiBold) }
+                    text = { Text("PDF Aç", fontWeight = FontWeight.Bold) }
                 )
             }
         ) { padding ->
@@ -198,29 +482,74 @@ class MainActivity : ComponentActivity() {
                 modifier = Modifier
                     .padding(padding)
                     .fillMaxSize()
-                    .padding(horizontal = 16.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp)
+                    .padding(horizontal = 14.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                Text("Son Açılan PDF'ler", fontSize = 13.sp, color = Color(0xFFA1A1AA), modifier = Modifier.padding(top = 6.dp))
-                if (recents.isEmpty()) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState())
+                ) {
+                    FilterChip(
+                        selected = selectedFolder == null,
+                        onClick = { selectedFolder = null },
+                        label = { Text("Tümü", fontSize = 12.sp) }
+                    )
+                    folders.forEach { f ->
+                        FilterChip(
+                            selected = selectedFolder == f,
+                            onClick = { selectedFolder = if (selectedFolder == f) null else f },
+                            label = { Text(f, fontSize = 12.sp) },
+                            trailingIcon = if (selectedFolder == f) {
+                                {
+                                    Icon(
+                                        Icons.Default.Close,
+                                        contentDescription = "Klasörü Sil",
+                                        modifier = Modifier.size(14.dp).clickable {
+                                            selectedFolder = null
+                                            onDeleteFolder(f)
+                                        }
+                                    )
+                                }
+                            } else null
+                        )
+                    }
+                    AssistChip(
+                        onClick = { showNewFolderDialog = true },
+                        leadingIcon = { Icon(Icons.Default.CreateNewFolder, contentDescription = null, modifier = Modifier.size(16.dp)) },
+                        label = { Text("Klasör", fontSize = 12.sp) }
+                    )
+                }
+
+                if (displayedList.isEmpty()) {
                     Surface(
                         shape = RoundedCornerShape(16.dp),
                         color = LITE_CARD,
                         border = BorderStroke(1.dp, LITE_BORDER),
-                        modifier = Modifier.fillMaxWidth()
+                        modifier = Modifier.fillMaxWidth().padding(top = 8.dp)
                     ) {
                         Column(modifier = Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                            Text("Henüz PDF açılmadı", color = Color.White, fontWeight = FontWeight.SemiBold)
                             Text(
-                                "Sağ alttan PDF seçebilir veya dosya yöneticisinden herhangi bir PDF'e basıp varsayılan olarak bu uygulamayı seçebilirsin.",
-                                fontSize = 12.sp,
-                                color = Color(0xFFA1A1AA)
+                                if (selectedFolder == null) "Henüz PDF açılmadı" else "'$selectedFolder' klasörü boş",
+                                color = Color.White,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                            Text(
+                                "Sağ alttan PDF seç veya Dosyalar/WhatsApp'tan doğrudan PDF aç.",
+                                color = Color(0xFFA1A1AA),
+                                fontSize = 13.sp
                             )
                         }
                     }
                 } else {
-                    LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        items(recents) { item ->
+                    LazyColumn(
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                        contentPadding = PaddingValues(bottom = 84.dp)
+                    ) {
+                        items(displayedList, key = { it.path }) { item ->
+                            val thumb by produceState<Bitmap?>(initialValue = null, item.path) {
+                                value = withContext(Dispatchers.IO) { PdfLiteEngine.getOrCreateThumbnail(this@MainActivity, item.path) }
+                            }
                             Surface(
                                 shape = RoundedCornerShape(14.dp),
                                 color = LITE_CARD,
@@ -230,14 +559,43 @@ class MainActivity : ComponentActivity() {
                                 Row(
                                     verticalAlignment = Alignment.CenterVertically,
                                     horizontalArrangement = Arrangement.spacedBy(12.dp),
-                                    modifier = Modifier.padding(14.dp)
+                                    modifier = Modifier.padding(10.dp)
                                 ) {
-                                    Icon(Icons.Default.PictureAsPdf, contentDescription = null, tint = PDF_RED, modifier = Modifier.size(28.dp))
-                                    Column(modifier = Modifier.weight(1f)) {
-                                        Text(item.title, color = Color.White, fontWeight = FontWeight.Medium, fontSize = 14.sp, maxLines = 1)
-                                        Text(if (item.lastPage > 0) "${item.pageCount} sayfa • Kaldığın: ${item.lastPage + 1}. sayfa" else "${item.pageCount} sayfa", color = Color(0xFFA1A1AA), fontSize = 11.sp)
+                                    Box(
+                                        modifier = Modifier
+                                            .size(width = 44.dp, height = 58.dp)
+                                            .clip(RoundedCornerShape(6.dp))
+                                            .background(Color(0xFF27272A)),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        val tBmp = thumb
+                                        if (tBmp != null) {
+                                            Image(
+                                                bitmap = tBmp.asImageBitmap(),
+                                                contentDescription = null,
+                                                contentScale = ContentScale.Crop,
+                                                modifier = Modifier.fillMaxSize()
+                                            )
+                                        } else {
+                                            Icon(Icons.Default.PictureAsPdf, contentDescription = null, tint = PDF_RED, modifier = Modifier.size(24.dp))
+                                        }
                                     }
-                                    Icon(Icons.Default.ChevronRight, contentDescription = null, tint = Color(0xFF71717A))
+                                    Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                        Text(item.title, color = Color.White, fontWeight = FontWeight.Medium, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                        val sizeTxt = PdfLiteEngine.formatSize(item.fileSizeBytes)
+                                        val sub = buildString {
+                                            append("${item.pageCount} sf")
+                                            if (sizeTxt.isNotEmpty()) append(" • $sizeTxt")
+                                            if (item.lastPage > 0) append(" • Kaldığın: ${item.lastPage + 1}.")
+                                        }
+                                        Text(sub, color = Color(0xFFA1A1AA), fontSize = 11.sp, maxLines = 1)
+                                    }
+                                    IconButton(onClick = { moveTargetItem = item }, modifier = Modifier.size(34.dp)) {
+                                        Icon(Icons.Default.FolderOpen, contentDescription = "Klasöre Taşı", tint = Color(0xFFA1A1AA), modifier = Modifier.size(18.dp))
+                                    }
+                                    IconButton(onClick = { deleteTargetItem = item }, modifier = Modifier.size(34.dp)) {
+                                        Icon(Icons.Default.DeleteOutline, contentDescription = "Sil", tint = Color(0xFFA1A1AA), modifier = Modifier.size(18.dp))
+                                    }
                                 }
                             }
                         }
@@ -291,6 +649,7 @@ class MainActivity : ComponentActivity() {
         var metaLoaded by remember(pdfPath) { mutableStateOf(false) }
         var optProgress by remember(pdfPath) { mutableStateOf<Pair<Int, Int>?>(null) }
         var securityReport by remember(pdfPath) { mutableStateOf<PdfSecurityReport?>(null) }
+        var showSecurityBanner by remember(pdfPath) { mutableStateOf(false) }
         var showSecurityDialog by remember { mutableStateOf(false) }
 
         LaunchedEffect(pdfPath) {
@@ -300,7 +659,10 @@ class MainActivity : ComponentActivity() {
                 val st = PdfLiteEngine.loadStrokes(this@MainActivity, pdfPath)
                 Triple(m, lp, st)
             }
-            securityReport = withContext(Dispatchers.IO) { PdfLiteEngine.scanPdfSecurity(pdfPath) }
+            val rep = withContext(Dispatchers.IO) { PdfLiteEngine.scanPdfSecurity(pdfPath) }
+            securityReport = rep
+            if (!rep.isSafe) showSecurityBanner = true
+
             pageCount = meta.pageCount
             splitEndStr = meta.pageCount.toString()
             pageRatios = meta.ratios
@@ -330,7 +692,14 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        // Persist last read page automatically
+        // Auto-hide initial security warning banner after 4.5s (stays accessible in More menu)
+        LaunchedEffect(showSecurityBanner) {
+            if (showSecurityBanner) {
+                delay(4500L)
+                showSecurityBanner = false
+            }
+        }
+
         LaunchedEffect(activePageIdx, metaLoaded, pdfPath) {
             if (!metaLoaded) return@LaunchedEffect
             withContext(Dispatchers.IO) {
@@ -338,7 +707,6 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        // Sliding window preload around activePageIdx (prevents OOM & keeps scroll rock solid)
         LaunchedEffect(activePageIdx, pageCount, metaLoaded, pdfPath) {
             if (!metaLoaded || pageBitmaps.size != pageCount) return@LaunchedEffect
             val winStart = (activePageIdx - 5).coerceAtLeast(0)
@@ -466,18 +834,9 @@ class MainActivity : ComponentActivity() {
                         }
                     },
                     title = {
-                        Text(title, fontSize = 16.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
+                        Text(title, fontSize = 16.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     },
                     actions = {
-                        securityReport?.let { rep ->
-                            IconButton(onClick = { showSecurityDialog = true }) {
-                                Icon(
-                                    imageVector = if (rep.isSafe) Icons.Default.VerifiedUser else Icons.Default.Warning,
-                                    contentDescription = "Güvenlik Raporu",
-                                    tint = if (rep.isSafe) Color(0xFF22C55E) else Color(0xFFF59E0B)
-                                )
-                            }
-                        }
                         IconButton(onClick = {
                             showSearchBar = !showSearchBar
                             if (!showSearchBar) {
@@ -533,6 +892,17 @@ class MainActivity : ComponentActivity() {
                                             startActivity(Intent.createChooser(send, "PDF Paylaş"))
                                         }
                                     }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("Güvenlik Raporu", color = Color.White) },
+                                    leadingIcon = {
+                                        Icon(
+                                            imageVector = if (securityReport?.isSafe != false) Icons.Default.VerifiedUser else Icons.Default.Warning,
+                                            contentDescription = null,
+                                            tint = if (securityReport?.isSafe != false) Color(0xFF22C55E) else Color(0xFFF59E0B)
+                                        )
+                                    },
+                                    onClick = { showMoreMenu = false; showSecurityDialog = true }
                                 )
                             }
                         }
@@ -749,6 +1119,47 @@ class MainActivity : ComponentActivity() {
                     }
                 }
 
+                if (showSecurityBanner) {
+                    Surface(
+                        shape = RoundedCornerShape(12.dp),
+                        color = Color(0xFF271F0E).copy(alpha = 0.96f),
+                        border = BorderStroke(1.dp, Color(0xFFF59E0B)),
+                        modifier = Modifier
+                            .align(Alignment.TopCenter)
+                            .padding(horizontal = 12.dp, vertical = 10.dp)
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
+                        ) {
+                            Icon(Icons.Default.Warning, contentDescription = null, tint = Color(0xFFF59E0B), modifier = Modifier.size(18.dp))
+                            Text(
+                                "Riskli etiket bulundu (izole modda güvenli)",
+                                fontSize = 12.sp,
+                                color = Color(0xFFFDE68A),
+                                modifier = Modifier.weight(1f)
+                            )
+                            Text(
+                                "Detay",
+                                fontSize = 12.sp,
+                                color = HONOR_BLUE,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.clickable {
+                                    showSecurityBanner = false
+                                    showSecurityDialog = true
+                                }
+                            )
+                            Icon(
+                                Icons.Default.Close,
+                                contentDescription = "Gizle",
+                                tint = Color(0xFFA1A1AA),
+                                modifier = Modifier.size(16.dp).clickable { showSecurityBanner = false }
+                            )
+                        }
+                    }
+                }
+
                 if (showSearchBar) {
                     Surface(
                         shape = RoundedCornerShape(14.dp),
@@ -771,47 +1182,47 @@ class MainActivity : ComponentActivity() {
                                 onValueChange = { q ->
                                     searchQuery = q
                                     scope.launch {
-                                        val hits = withContext(Dispatchers.IO) { PdfLiteEngine.searchPdfContent(pdfPath, q) }
-                                        searchHits = hits
+                                        val res = withContext(Dispatchers.IO) { PdfLiteEngine.searchPdfContent(pdfPath, q) }
+                                        searchHits = res
                                         searchHitIdx = 0
-                                        if (hits.isNotEmpty()) {
-                                            jumpTargetPage = hits[0].pageIdx
-                                            jumpTargetRect = hits[0].rectVirtual
+                                        if (res.isNotEmpty()) {
+                                            jumpTargetPage = res[0].pageIdx
+                                            jumpTargetRect = res[0].rectVirtual
                                             jumpTrigger++
                                         }
                                     }
                                 },
                                 singleLine = true,
-                                cursorBrush = SolidColor(PDF_RED),
                                 textStyle = TextStyle(fontSize = 14.sp, color = Color.White),
+                                cursorBrush = SolidColor(PDF_RED),
                                 decorationBox = { inner ->
-                                    if (searchQuery.isEmpty()) Text("Dosya içinde bul...", fontSize = 13.sp, color = Color(0xFF71717A))
+                                    if (searchQuery.isEmpty()) Text("Dosya içinde bul...", fontSize = 14.sp, color = Color(0xFF71717A))
                                     inner()
                                 },
                                 modifier = Modifier.weight(1f).padding(vertical = 6.dp)
                             )
-                            if (searchQuery.isNotEmpty()) {
-                                Text(
-                                    if (searchHits.isEmpty()) "0/0" else "${searchHitIdx + 1}/${searchHits.size}",
-                                    fontSize = 11.sp,
-                                    color = if (searchHits.isEmpty()) PDF_RED else Color(0xFF22C55E)
-                                )
+                            if (searchHits.isNotEmpty()) {
+                                Text("${searchHitIdx + 1}/${searchHits.size}", fontSize = 11.sp, color = Color(0xFFA1A1AA))
                             }
                             IconButton(
                                 enabled = searchHits.isNotEmpty(),
                                 onClick = {
-                                    searchHitIdx = if (searchHitIdx - 1 < 0) searchHits.lastIndex else searchHitIdx - 1
-                                    val h = searchHits[searchHitIdx]
-                                    jumpTargetPage = h.pageIdx; jumpTargetRect = h.rectVirtual; jumpTrigger++
+                                    val prev = (searchHitIdx - 1 + searchHits.size) % searchHits.size
+                                    searchHitIdx = prev
+                                    jumpTargetPage = searchHits[prev].pageIdx
+                                    jumpTargetRect = searchHits[prev].rectVirtual
+                                    jumpTrigger++
                                 },
                                 modifier = Modifier.size(28.dp)
                             ) { Icon(Icons.Default.KeyboardArrowUp, contentDescription = null, tint = Color.White) }
                             IconButton(
                                 enabled = searchHits.isNotEmpty(),
                                 onClick = {
-                                    searchHitIdx = (searchHitIdx + 1) % searchHits.size
-                                    val h = searchHits[searchHitIdx]
-                                    jumpTargetPage = h.pageIdx; jumpTargetRect = h.rectVirtual; jumpTrigger++
+                                    val next = (searchHitIdx + 1) % searchHits.size
+                                    searchHitIdx = next
+                                    jumpTargetPage = searchHits[next].pageIdx
+                                    jumpTargetRect = searchHits[next].rectVirtual
+                                    jumpTrigger++
                                 },
                                 modifier = Modifier.size(28.dp)
                             ) { Icon(Icons.Default.KeyboardArrowDown, contentDescription = null, tint = Color.White) }
