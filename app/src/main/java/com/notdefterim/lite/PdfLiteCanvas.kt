@@ -17,16 +17,47 @@ class PdfReaderView(context: Context) : View(context) {
     var pageCount: Int = 0
         set(value) { if (field != value) { field = value; rebuildMetrics(); invalidate() } }
     var pageRatios: List<Float> = emptyList()
-        set(value) { if (field !== value) { field = value; rebuildMetrics(); invalidate() } }
+        set(value) {
+            if (field != value) {
+                field = value
+                rebuildMetrics()
+                clampPan()
+                invalidate()
+            }
+        }
     var pageBitmaps: List<Bitmap?> = emptyList()
-        set(value) { field = value; clampPan(); invalidate() }
+        set(value) { field = value; invalidate() }
     var strokesByPage: Map<Int, List<LiteStroke>> = emptyMap()
         set(value) { field = value; invalidate() }
 
     var singlePageMode: Boolean = false
-        set(value) { if (field != value) { field = value; panX = 0f; panY = 0f; clampPan(); invalidate() } }
+        set(value) {
+            if (field != value) {
+                scroller.forceFinished(true)
+                field = value
+                panX = 0f
+                panY = if (!value && currentSinglePage in cachedTops.indices) {
+                    -(cachedTops[currentSinglePage] * totalScale())
+                } else {
+                    0f
+                }
+                clampPan()
+                invalidate()
+            }
+        }
     var currentSinglePage: Int = 0
-        set(value) { if (field != value) { field = value; panX = 0f; panY = 0f; clampPan(); invalidate() } }
+        set(value) {
+            if (field != value) {
+                field = value
+                if (singlePageMode) {
+                    scroller.forceFinished(true)
+                    panX = 0f
+                    panY = 0f
+                    clampPan()
+                    invalidate()
+                }
+            }
+        }
 
     var darkInvert: Boolean = false
         set(value) { if (field != value) { field = value; invalidate() } }
@@ -321,6 +352,7 @@ class PdfReaderView(context: Context) : View(context) {
                 invalidate()
             }
             MotionEvent.ACTION_MOVE -> {
+                if (activePoints.isEmpty()) return true
                 val topY = if (singlePageMode) 12f else cachedTops.getOrElse(activeDrawPage) { 12f }
                 val maxH = cachedHeights.getOrElse(activeDrawPage) { 1414f }
                 val cx = docX
@@ -343,6 +375,11 @@ class PdfReaderView(context: Context) : View(context) {
             }
         }
         return true
+    }
+
+    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+        super.onSizeChanged(w, h, oldw, oldh)
+        clampPan()
     }
 
     override fun onDraw(canvas: Canvas) {

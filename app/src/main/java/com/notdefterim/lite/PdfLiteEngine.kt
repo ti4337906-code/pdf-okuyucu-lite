@@ -84,6 +84,22 @@ object PdfLiteEngine {
         } catch (_: Exception) { 0 }
     }
 
+    fun getAllPageAspectRatios(pdfPath: String): List<Float> {
+        val file = File(pdfPath)
+        if (!file.exists()) return emptyList()
+        return try {
+            ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY).use { fd ->
+                PdfRenderer(fd).use { renderer ->
+                    List(renderer.pageCount) { i ->
+                        renderer.openPage(i).use { p ->
+                            p.width.toFloat() / p.height.coerceAtLeast(1).toFloat()
+                        }
+                    }
+                }
+            }
+        } catch (_: Exception) { emptyList() }
+    }
+
     fun getPageAspectRatio(pdfPath: String, pageIdx: Int): Float {
         val file = File(pdfPath)
         if (!file.exists()) return 1f / 1.414f

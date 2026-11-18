@@ -285,52 +285,33 @@ class MainActivity : ComponentActivity() {
         var resetZoomTrigger by remember { mutableIntStateOf(0) }
 
         LaunchedEffect(pdfPath) {
-            val count = withContext(Dispatchers.IO) { PdfLiteEngine.getPageCount(pdfPath).coerceAtLeast(1) }
+            val (count, ratios) = withContext(Dispatchers.IO) {
+                val r = PdfLiteEngine.getAllPageAspectRatios(pdfPath)
+                val c = if (r.isNotEmpty()) r.size else PdfLiteEngine.getPageCount(pdfPath).coerceAtLeast(1)
+                c to (if (r.isNotEmpty()) r else List(c) { 1f / 1.414f })
+            }
             pageCount = count
             splitEndStr = count.toString()
-            val bmps = MutableList<Bitmap?>(count) { null }
-            val ratios = MutableList(count) { 1f / 1.414f }
-            for (i in 0 until count) {
-                val (b, r) = withContext(Dispatchers.IO) {
-                    val bmp = PdfLiteEngine.renderPageBitmap(pdfPath, i, 1200)
-                    val rt = if (bmp != null) bmp.width.toFloat() / bmp.height.coerceAtLeast(1).toFloat()
-                    else PdfLiteEngine.getPageAspectRatio(pdfPath, i)
-                    bmp to rt
-                }
-                bmps[i] = b
-                ratios[i] = r
-                if (i == 0 || i == count - 1 || i % 3 == 0) {
-                    pageBitmaps = bmps.toList()
-                    pageRatios = ratios.toList()
-                }
-            }
+            pageRatios = ratios
+            pageBitmaps = List(count) { null }
         }
 
-        // Priority preload around activePageIdx on fast jumps
-        LaunchedEffect(activePageIdx, pageCount) {
-            if (pageBitmaps.isEmpty()) return@LaunchedEffect
-            val s = (activePageIdx - 1).coerceAtLeast(0)
-            val e = (activePageIdx + 2).coerceAtMost(pageCount - 1)
-            var changed = false
+        // Sliding window preload around activePageIdx (prevents OOM & keeps scroll rock solid)
+        LaunchedEffect(activePageIdx, pageCount, pdfPath) {
+            if (pageBitmaps.size != pageCount) return@LaunchedEffect
+            val winStart = (activePageIdx - 5).coerceAtLeast(0)
+            val winEnd = (activePageIdx + 7).coerceAtMost(pageCount - 1)
             val bmps = pageBitmaps.toMutableList()
-            val ratios = pageRatios.toMutableList()
-            for (i in s..e) {
-                if (i in bmps.indices && bmps[i] == null) {
-                    val (b, r) = withContext(Dispatchers.IO) {
-                        val bmp = PdfLiteEngine.renderPageBitmap(pdfPath, i, 1200)
-                        val rt = if (bmp != null) bmp.width.toFloat() / bmp.height.coerceAtLeast(1).toFloat()
-                        else PdfLiteEngine.getPageAspectRatio(pdfPath, i)
-                        bmp to rt
-                    }
-                    bmps[i] = b
-                    ratios[i] = r
+            var changed = false
+            for (i in bmps.indices) {
+                if (i < winStart || i > winEnd) {
+                    if (bmps[i] != null) { bmps[i] = null; changed = true }
+                } else if (bmps[i] == null) {
+                    bmps[i] = withContext(Dispatchers.IO) { PdfLiteEngine.renderPageBitmap(pdfPath, i, 1200) }
                     changed = true
                 }
             }
-            if (changed) {
-                pageBitmaps = bmps
-                pageRatios = ratios
-            }
+            if (changed) pageBitmaps = bmps
         }
 
         if (showSplitDialog) {
