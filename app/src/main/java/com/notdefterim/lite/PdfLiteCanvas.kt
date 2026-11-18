@@ -230,6 +230,9 @@ class PdfReaderView(context: Context) : View(context) {
         }
         clampPan()
         onActivePageChanged?.invoke(pageIdx)
+        val minY = minPanY()
+        val frac = if (minY < -1f) (panY / minY).coerceIn(0f, 1f) else 0f
+        onScrollFractionChanged?.invoke(frac)
         invalidate()
     }
 

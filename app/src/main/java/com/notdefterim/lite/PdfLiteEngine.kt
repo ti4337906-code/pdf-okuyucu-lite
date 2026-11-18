@@ -22,13 +22,15 @@ import org.json.JSONObject
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.security.MessageDigest
 import java.util.UUID
 
 data class RecentPdfItem(
     val title: String,
     val path: String,
     val pageCount: Int,
-    val openedAtMs: Long
+    val openedAtMs: Long,
+    val lastPage: Int = 0
 )
 
 data class LiteStroke(
@@ -43,8 +45,30 @@ data class PdfSearchHit(
     val rectVirtual: RectF?
 )
 
+data class PdfMeta(
+    val pageCount: Int,
+    val ratios: List<Float>,
+    val optimized: Boolean
+)
+
 object PdfLiteEngine {
-    private val pageCache = LruCache<String, Bitmap>(32)
+    // 48-page in-memory LRU cache for instant back-and-forth scrolling
+    private val pageCache = LruCache<String, Bitmap>(48)
+
+    private fun docId(pdfPath: String): String = File(pdfPath).nameWithoutExtension
+
+    private fun optDir(context: Context, pdfPath: String): File =
+        File(context.cacheDir, "pdf_opt/${docId(pdfPath)}").apply { mkdirs() }
+
+    private fun pagesDir(context: Context, pdfPath: String): File =
+        File(optDir(context, pdfPath), "pages").apply { mkdirs() }
+
+    private fun pageFile(context: Context, pdfPath: String, pageIdx: Int): File =
+        File(pagesDir(context, pdfPath), "p_$pageIdx.webp")
+
+    private fun webpFormat(): Bitmap.CompressFormat =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) Bitmap.CompressFormat.WEBP_LOSSY
+        else @Suppress("DEPRECATION") Bitmap.CompressFormat.WEBP
 
     fun getDisplayName(context: Context, uri: Uri): String {
         var name: String? = null
@@ -60,64 +84,127 @@ object PdfLiteEngine {
         return (name ?: "Belge").substringBeforeLast('.').ifBlank { "Belge" }
     }
 
+    /**
+     * Streams URI once while computing SHA-256 fingerprint so opening the same PDF again
+     * reuses the existing internal file, its pre-rendered WebP cache, last page, and strokes.
+     */
     fun importPdfUri(context: Context, uri: Uri): Pair<String, String>? {
         return try {
             val title = getDisplayName(context, uri)
             val dir = File(context.filesDir, "lite_pdfs").apply { mkdirs() }
-            val outFile = File(dir, "${UUID.randomUUID()}.pdf")
+            val tmp = File(dir, "tmp_${UUID.randomUUID()}.pdf")
+            val md = MessageDigest.getInstance("SHA-256")
+            var totalBytes = 0L
             context.contentResolver.openInputStream(uri)?.use { inp ->
-                FileOutputStream(outFile).use { out -> inp.copyTo(out) }
+                FileOutputStream(tmp).use { out ->
+                    val buf = ByteArray(32768)
+                    while (true) {
+                        val r = inp.read(buf)
+                        if (r <= 0) break
+                        out.write(buf, 0, r)
+                        md.update(buf, 0, r)
+                        totalBytes += r
+                    }
+                }
             } ?: return null
-            outFile.absolutePath to title
+
+            if (totalBytes <= 0L) {
+                tmp.delete()
+                return null
+            }
+
+            val hex = md.digest().take(8).joinToString("") { "%02x".format(it) }
+            val target = File(dir, "${hex}_${totalBytes}.pdf")
+            if (target.exists() && target.length() == totalBytes) {
+                tmp.delete()
+            } else {
+                if (!tmp.renameTo(target)) {
+                    tmp.copyTo(target, overwrite = true)
+                    tmp.delete()
+                }
+            }
+            target.absolutePath to title
         } catch (_: Exception) {
             null
         }
     }
 
-    fun getPageCount(pdfPath: String): Int {
-        val file = File(pdfPath)
-        if (!file.exists()) return 0
-        return try {
-            ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY).use { fd ->
-                PdfRenderer(fd).use { it.pageCount }
-            }
-        } catch (_: Exception) { 0 }
-    }
+    /**
+     * Loads cached pageCount + aspect ratios in <1ms on subsequent opens;
+     * falls back to a single PdfRenderer pass on first open and persists meta.json.
+     */
+    fun getOrBuildMeta(context: Context, pdfPath: String): PdfMeta {
+        val metaFile = File(optDir(context, pdfPath), "meta.json")
+        if (metaFile.exists()) {
+            try {
+                val obj = JSONObject(metaFile.readText())
+                val count = obj.getInt("c").coerceAtLeast(1)
+                val arr = obj.getJSONArray("r")
+                val ratios = List(count) { i ->
+                    if (i < arr.length()) arr.getDouble(i).toFloat() else 1f / 1.414f
+                }
+                val opt = obj.optBoolean("opt", false)
+                return PdfMeta(count, ratios, opt)
+            } catch (_: Exception) {}
+        }
 
-    fun getAllPageAspectRatios(pdfPath: String): List<Float> {
         val file = File(pdfPath)
-        if (!file.exists()) return emptyList()
+        if (!file.exists()) return PdfMeta(1, listOf(1f / 1.414f), false)
         return try {
             ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY).use { fd ->
                 PdfRenderer(fd).use { renderer ->
-                    List(renderer.pageCount) { i ->
-                        renderer.openPage(i).use { p ->
-                            p.width.toFloat() / p.height.coerceAtLeast(1).toFloat()
-                        }
+                    val count = renderer.pageCount.coerceAtLeast(1)
+                    val ratios = List(count) { i ->
+                        if (i < renderer.pageCount) {
+                            renderer.openPage(i).use { p ->
+                                p.width.toFloat() / p.height.coerceAtLeast(1).toFloat()
+                            }
+                        } else 1f / 1.414f
                     }
+                    saveMeta(context, pdfPath, PdfMeta(count, ratios, false))
+                    PdfMeta(count, ratios, false)
                 }
             }
-        } catch (_: Exception) { emptyList() }
+        } catch (_: Exception) {
+            PdfMeta(1, listOf(1f / 1.414f), false)
+        }
     }
 
-    fun getPageAspectRatio(pdfPath: String, pageIdx: Int): Float {
-        val file = File(pdfPath)
-        if (!file.exists()) return 1f / 1.414f
-        return try {
-            ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY).use { fd ->
-                PdfRenderer(fd).use { renderer ->
-                    if (pageIdx !in 0 until renderer.pageCount) return 1f / 1.414f
-                    renderer.openPage(pageIdx).use { p ->
-                        p.width.toFloat() / p.height.coerceAtLeast(1).toFloat()
-                    }
-                }
+    private fun saveMeta(context: Context, pdfPath: String, meta: PdfMeta) {
+        try {
+            val obj = JSONObject().apply {
+                put("c", meta.pageCount)
+                put("opt", meta.optimized)
+                put("r", JSONArray().apply { meta.ratios.forEach { put(it.toDouble()) } })
             }
-        } catch (_: Exception) { 1f / 1.414f }
+            File(optDir(context, pdfPath), "meta.json").writeText(obj.toString())
+        } catch (_: Exception) {}
     }
 
-    fun renderPageBitmap(pdfPath: String, pageIdx: Int, targetWidth: Int = 1200): Bitmap? {
-        val key = "$pdfPath:$pageIdx:$targetWidth"
+    /**
+     * Fast-path bitmap loader:
+     * 1) In-memory LruCache (0ms)
+     * 2) Pre-optimized WebP on disk decoded as RGB_565 (50% less RAM, ~4ms)
+     * 3) Live PdfRenderer fallback (and saves WebP for next open)
+     */
+    fun renderPageBitmap(context: Context, pdfPath: String, pageIdx: Int, targetWidth: Int = 1200): Bitmap? {
+        val key = "${docId(pdfPath)}:$pageIdx:$targetWidth"
         pageCache.get(key)?.let { if (!it.isRecycled) return it }
+
+        val pf = pageFile(context, pdfPath, pageIdx)
+        if (pf.exists() && pf.length() > 0L) {
+            try {
+                val opts = BitmapFactory.Options().apply {
+                    inPreferredConfig = Bitmap.Config.RGB_565
+                }
+                val decoded = BitmapFactory.decodeFile(pf.absolutePath, opts)
+                if (decoded != null) {
+                    pageCache.put(key, decoded)
+                    return decoded
+                }
+            } catch (_: Exception) {}
+        }
+
         val file = File(pdfPath)
         if (!file.exists()) return null
         return try {
@@ -130,12 +217,157 @@ object PdfLiteEngine {
                         val bmp = Bitmap.createBitmap(targetWidth, h, Bitmap.Config.ARGB_8888)
                         bmp.eraseColor(Color.WHITE)
                         page.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                        try {
+                            FileOutputStream(pf).use { out -> bmp.compress(webpFormat(), 90, out) }
+                        } catch (_: Exception) {}
                         pageCache.put(key, bmp)
                         bmp
                     }
                 }
             }
         } catch (_: Exception) { null }
+    }
+
+    /**
+     * Full first-open background optimization:
+     * Renders every page into a WebP disk cache in a single PdfRenderer session,
+     * starting from the user's current page outward so subsequent opens are instant.
+     */
+    fun optimizePdfInBackground(
+        context: Context,
+        pdfPath: String,
+        meta: PdfMeta,
+        startPage: Int,
+        targetWidth: Int = 1200,
+        isCancelled: () -> Boolean,
+        onProgress: (done: Int, total: Int) -> Unit
+    ) {
+        if (meta.optimized) return
+        val file = File(pdfPath)
+        if (!file.exists()) return
+        val total = meta.pageCount
+        // Order pages outward from startPage
+        val order = (0 until total).sortedBy { kotlin.math.abs(it - startPage) }
+        var doneCount = 0
+        try {
+            ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY).use { fd ->
+                PdfRenderer(fd).use { renderer ->
+                    val fmt = webpFormat()
+                    var reusableBmp: Bitmap? = null
+                    for (idx in order) {
+                        if (isCancelled()) break
+                        val pf = pageFile(context, pdfPath, idx)
+                        if (pf.exists() && pf.length() > 0L) {
+                            doneCount++
+                            onProgress(doneCount, total)
+                            continue
+                        }
+                        if (idx in 0 until renderer.pageCount) {
+                            renderer.openPage(idx).use { page ->
+                                val scale = targetWidth.toFloat() / page.width.coerceAtLeast(1)
+                                val h = (page.height * scale).toInt().coerceAtLeast(1)
+                                val bmp = if (reusableBmp != null && reusableBmp.width == targetWidth && reusableBmp.height == h) {
+                                    reusableBmp
+                                } else {
+                                    reusableBmp?.recycle()
+                                    Bitmap.createBitmap(targetWidth, h, Bitmap.Config.ARGB_8888).also { reusableBmp = it }
+                                }
+                                bmp.eraseColor(Color.WHITE)
+                                page.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                                FileOutputStream(pf).use { out -> bmp.compress(fmt, 90, out) }
+                            }
+                        }
+                        doneCount++
+                        onProgress(doneCount, total)
+                    }
+                    reusableBmp?.recycle()
+                }
+            }
+            if (!isCancelled() && doneCount >= total) {
+                saveMeta(context, pdfPath, meta.copy(optimized = true))
+            }
+        } catch (_: Exception) {}
+    }
+
+    fun getLastPage(context: Context, pdfPath: String): Int =
+        context.getSharedPreferences("lite_prefs", Context.MODE_PRIVATE)
+            .getInt("lp_${docId(pdfPath)}", 0).coerceAtLeast(0)
+
+    fun saveLastPage(context: Context, pdfPath: String, pageIdx: Int) {
+        val prefs = context.getSharedPreferences("lite_prefs", Context.MODE_PRIVATE)
+        prefs.edit().putInt("lp_${docId(pdfPath)}", pageIdx.coerceAtLeast(0)).apply()
+        // Keep recents list synced with lastPage
+        val list = loadRecents(context).map {
+            if (it.path == pdfPath) it.copy(lastPage = pageIdx.coerceAtLeast(0)) else it
+        }
+        writeRecents(context, list)
+    }
+
+    fun saveStrokes(context: Context, pdfPath: String, strokesByPage: Map<Int, List<LiteStroke>>) {
+        try {
+            val file = File(optDir(context, pdfPath), "strokes.json")
+            if (strokesByPage.values.all { it.isEmpty() }) {
+                if (file.exists()) file.delete()
+                return
+            }
+            val root = JSONObject()
+            strokesByPage.forEach { (pIdx, list) ->
+                if (list.isNotEmpty()) {
+                    val arr = JSONArray()
+                    list.forEach { st ->
+                        val o = JSONObject()
+                        o.put("c", st.colorArgb)
+                        o.put("w", st.width.toDouble())
+                        o.put("h", st.isHighlighter)
+                        val pts = JSONArray()
+                        st.points.forEach { pt ->
+                            pts.put(pt.x.toDouble())
+                            pts.put(pt.y.toDouble())
+                        }
+                        o.put("p", pts)
+                        arr.put(o)
+                    }
+                    root.put(pIdx.toString(), arr)
+                }
+            }
+            file.writeText(root.toString())
+        } catch (_: Exception) {}
+    }
+
+    fun loadStrokes(context: Context, pdfPath: String): Map<Int, List<LiteStroke>> {
+        val file = File(optDir(context, pdfPath), "strokes.json")
+        if (!file.exists()) return emptyMap()
+        return try {
+            val root = JSONObject(file.readText())
+            val out = mutableMapOf<Int, List<LiteStroke>>()
+            val keys = root.keys()
+            while (keys.hasNext()) {
+                val k = keys.next()
+                val pIdx = k.toIntOrNull() ?: continue
+                val arr = root.getJSONArray(k)
+                val list = mutableListOf<LiteStroke>()
+                for (i in 0 until arr.length()) {
+                    val o = arr.getJSONObject(i)
+                    val ptsArr = o.getJSONArray("p")
+                    val pts = ArrayList<PointF>(ptsArr.length() / 2)
+                    var j = 0
+                    while (j + 1 < ptsArr.length()) {
+                        pts.add(PointF(ptsArr.getDouble(j).toFloat(), ptsArr.getDouble(j + 1).toFloat()))
+                        j += 2
+                    }
+                    list.add(
+                        LiteStroke(
+                            points = pts,
+                            colorArgb = o.getInt("c"),
+                            width = o.getDouble("w").toFloat(),
+                            isHighlighter = o.getBoolean("h")
+                        )
+                    )
+                }
+                if (list.isNotEmpty()) out[pIdx] = list
+            }
+            out
+        } catch (_: Exception) { emptyMap() }
     }
 
     /**
@@ -312,16 +544,22 @@ object PdfLiteEngine {
     }
 
     fun saveRecent(context: Context, item: RecentPdfItem) {
-        val list = loadRecents(context).filterNot { it.path == item.path }.toMutableList()
-        list.add(0, item)
-        val trimmed = list.take(12)
+        val existing = loadRecents(context)
+        val prevLast = existing.firstOrNull { it.path == item.path }?.lastPage ?: item.lastPage
+        val list = existing.filterNot { it.path == item.path }.toMutableList()
+        list.add(0, item.copy(lastPage = prevLast))
+        writeRecents(context, list.take(12))
+    }
+
+    private fun writeRecents(context: Context, items: List<RecentPdfItem>) {
         val arr = JSONArray()
-        trimmed.forEach { r ->
+        items.forEach { r ->
             val o = JSONObject()
             o.put("t", r.title)
             o.put("p", r.path)
             o.put("c", r.pageCount)
             o.put("ts", r.openedAtMs)
+            o.put("lp", r.lastPage)
             arr.put(o)
         }
         context.getSharedPreferences("lite_prefs", Context.MODE_PRIVATE)
@@ -339,7 +577,8 @@ object PdfLiteEngine {
                     title = o.getString("t"),
                     path = o.getString("p"),
                     pageCount = o.getInt("c"),
-                    openedAtMs = o.getLong("ts")
+                    openedAtMs = o.getLong("ts"),
+                    lastPage = o.optInt("lp", 0)
                 )
             }.filter { File(it.path).exists() }
         } catch (_: Exception) { emptyList() }

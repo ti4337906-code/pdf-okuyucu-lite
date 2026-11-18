@@ -46,6 +46,7 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlin.math.roundToInt
@@ -91,6 +92,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
+        setIntent(intent)
         if (intent.action == Intent.ACTION_VIEW && intent.data != null) {
             incomingPdfUri = intent.data
         }
@@ -106,11 +108,11 @@ class MainActivity : ComponentActivity() {
             val uri = incomingPdfUri ?: return@LaunchedEffect
             val imported = withContext(Dispatchers.IO) { PdfLiteEngine.importPdfUri(this@MainActivity, uri) }
             if (imported != null) {
-                val count = withContext(Dispatchers.IO) { PdfLiteEngine.getPageCount(imported.first) }
+                val meta = withContext(Dispatchers.IO) { PdfLiteEngine.getOrBuildMeta(this@MainActivity, imported.first) }
                 withContext(Dispatchers.IO) {
                     PdfLiteEngine.saveRecent(
                         this@MainActivity,
-                        RecentPdfItem(imported.second, imported.first, count, System.currentTimeMillis())
+                        RecentPdfItem(imported.second, imported.first, meta.pageCount, System.currentTimeMillis())
                     )
                 }
                 recents = PdfLiteEngine.loadRecents(this@MainActivity)
@@ -126,11 +128,11 @@ class MainActivity : ComponentActivity() {
             scope.launch {
                 val imported = withContext(Dispatchers.IO) { PdfLiteEngine.importPdfUri(this@MainActivity, uri) }
                 if (imported != null) {
-                    val count = withContext(Dispatchers.IO) { PdfLiteEngine.getPageCount(imported.first) }
+                    val meta = withContext(Dispatchers.IO) { PdfLiteEngine.getOrBuildMeta(this@MainActivity, imported.first) }
                     withContext(Dispatchers.IO) {
                         PdfLiteEngine.saveRecent(
                             this@MainActivity,
-                            RecentPdfItem(imported.second, imported.first, count, System.currentTimeMillis())
+                            RecentPdfItem(imported.second, imported.first, meta.pageCount, System.currentTimeMillis())
                         )
                     }
                     recents = PdfLiteEngine.loadRecents(this@MainActivity)
@@ -150,7 +152,10 @@ class MainActivity : ComponentActivity() {
             ReaderScreen(
                 pdfPath = active.first,
                 title = active.second,
-                onBack = { openPdf = null }
+                onBack = {
+                    openPdf = null
+                    recents = PdfLiteEngine.loadRecents(this@MainActivity)
+                }
             )
         }
     }
@@ -230,7 +235,7 @@ class MainActivity : ComponentActivity() {
                                     Icon(Icons.Default.PictureAsPdf, contentDescription = null, tint = PDF_RED, modifier = Modifier.size(28.dp))
                                     Column(modifier = Modifier.weight(1f)) {
                                         Text(item.title, color = Color.White, fontWeight = FontWeight.Medium, fontSize = 14.sp, maxLines = 1)
-                                        Text("${item.pageCount} sayfa", color = Color(0xFFA1A1AA), fontSize = 11.sp)
+                                        Text(if (item.lastPage > 0) "${item.pageCount} sayfa • Kaldığın: ${item.lastPage + 1}. sayfa" else "${item.pageCount} sayfa", color = Color(0xFFA1A1AA), fontSize = 11.sp)
                                     }
                                     Icon(Icons.Default.ChevronRight, contentDescription = null, tint = Color(0xFF71717A))
                                 }
@@ -283,22 +288,56 @@ class MainActivity : ComponentActivity() {
         var scrollFraction by remember { mutableFloatStateOf(0f) }
         var isDraggingScrollbar by remember { mutableStateOf(false) }
         var resetZoomTrigger by remember { mutableIntStateOf(0) }
+        var metaLoaded by remember(pdfPath) { mutableStateOf(false) }
+        var optProgress by remember(pdfPath) { mutableStateOf<Pair<Int, Int>?>(null) }
 
         LaunchedEffect(pdfPath) {
-            val (count, ratios) = withContext(Dispatchers.IO) {
-                val r = PdfLiteEngine.getAllPageAspectRatios(pdfPath)
-                val c = if (r.isNotEmpty()) r.size else PdfLiteEngine.getPageCount(pdfPath).coerceAtLeast(1)
-                c to (if (r.isNotEmpty()) r else List(c) { 1f / 1.414f })
+            val (meta, savedPage, savedStrokes) = withContext(Dispatchers.IO) {
+                val m = PdfLiteEngine.getOrBuildMeta(this@MainActivity, pdfPath)
+                val lp = PdfLiteEngine.getLastPage(this@MainActivity, pdfPath).coerceIn(0, m.pageCount - 1)
+                val st = PdfLiteEngine.loadStrokes(this@MainActivity, pdfPath)
+                Triple(m, lp, st)
             }
-            pageCount = count
-            splitEndStr = count.toString()
-            pageRatios = ratios
-            pageBitmaps = List(count) { null }
+            pageCount = meta.pageCount
+            splitEndStr = meta.pageCount.toString()
+            pageRatios = meta.ratios
+            strokesByPage = savedStrokes
+            activePageIdx = savedPage
+            pageBitmaps = List(meta.pageCount) { null }
+            metaLoaded = true
+            if (savedPage > 0) {
+                jumpTargetPage = savedPage
+                jumpTargetRect = null
+                jumpTrigger++
+            }
+            if (!meta.optimized) {
+                withContext(Dispatchers.IO) {
+                    PdfLiteEngine.optimizePdfInBackground(
+                        context = this@MainActivity,
+                        pdfPath = pdfPath,
+                        meta = meta,
+                        startPage = savedPage,
+                        isCancelled = { !isActive },
+                        onProgress = { done, total ->
+                            optProgress = if (done < total) done to total else null
+                        }
+                    )
+                }
+                optProgress = null
+            }
+        }
+
+        // Persist last read page automatically
+        LaunchedEffect(activePageIdx, metaLoaded, pdfPath) {
+            if (!metaLoaded) return@LaunchedEffect
+            withContext(Dispatchers.IO) {
+                PdfLiteEngine.saveLastPage(this@MainActivity, pdfPath, activePageIdx)
+            }
         }
 
         // Sliding window preload around activePageIdx (prevents OOM & keeps scroll rock solid)
-        LaunchedEffect(activePageIdx, pageCount, pdfPath) {
-            if (pageBitmaps.size != pageCount) return@LaunchedEffect
+        LaunchedEffect(activePageIdx, pageCount, metaLoaded, pdfPath) {
+            if (!metaLoaded || pageBitmaps.size != pageCount) return@LaunchedEffect
             val winStart = (activePageIdx - 5).coerceAtLeast(0)
             val winEnd = (activePageIdx + 7).coerceAtMost(pageCount - 1)
             val bmps = pageBitmaps.toMutableList()
@@ -307,7 +346,9 @@ class MainActivity : ComponentActivity() {
                 if (i < winStart || i > winEnd) {
                     if (bmps[i] != null) { bmps[i] = null; changed = true }
                 } else if (bmps[i] == null) {
-                    bmps[i] = withContext(Dispatchers.IO) { PdfLiteEngine.renderPageBitmap(pdfPath, i, 1200) }
+                    bmps[i] = withContext(Dispatchers.IO) {
+                        PdfLiteEngine.renderPageBitmap(this@MainActivity, pdfPath, i, 1200)
+                    }
                     changed = true
                 }
             }
@@ -482,7 +523,11 @@ class MainActivity : ComponentActivity() {
                                 IconButton(
                                     onClick = {
                                         val cur = strokesByPage[activePageIdx].orEmpty()
-                                        if (cur.isNotEmpty()) strokesByPage = strokesByPage + (activePageIdx to cur.dropLast(1))
+                                        if (cur.isNotEmpty()) {
+                                            val next = strokesByPage + (activePageIdx to cur.dropLast(1))
+                                            strokesByPage = next
+                                            scope.launch(Dispatchers.IO) { PdfLiteEngine.saveStrokes(this@MainActivity, pdfPath, next) }
+                                        }
                                     },
                                     modifier = Modifier.size(30.dp)
                                 ) {
@@ -558,10 +603,14 @@ class MainActivity : ComponentActivity() {
                     resetZoomTrigger = resetZoomTrigger,
                     onStrokeAdded = { pIdx, st ->
                         val cur = strokesByPage[pIdx].orEmpty()
-                        strokesByPage = strokesByPage + (pIdx to (cur + st))
+                        val next = strokesByPage + (pIdx to (cur + st))
+                        strokesByPage = next
+                        scope.launch(Dispatchers.IO) { PdfLiteEngine.saveStrokes(this@MainActivity, pdfPath, next) }
                     },
                     onStrokeErased = { pIdx, rem ->
-                        strokesByPage = strokesByPage + (pIdx to rem)
+                        val next = strokesByPage + (pIdx to rem)
+                        strokesByPage = next
+                        scope.launch(Dispatchers.IO) { PdfLiteEngine.saveStrokes(this@MainActivity, pdfPath, next) }
                     },
                     onActivePageChanged = { activePageIdx = it },
                     onScrollFractionChanged = { if (!isDraggingScrollbar) scrollFraction = it },
@@ -622,6 +671,24 @@ class MainActivity : ComponentActivity() {
                                 Icon(Icons.Default.UnfoldMore, contentDescription = null, tint = Color.White, modifier = Modifier.size(14.dp))
                             }
                         }
+                    }
+                }
+
+                optProgress?.let { (done, total) ->
+                    Surface(
+                        shape = RoundedCornerShape(10.dp),
+                        color = LITE_CARD.copy(alpha = 0.92f),
+                        border = BorderStroke(1.dp, HONOR_BLUE.copy(alpha = 0.6f)),
+                        modifier = Modifier
+                            .align(Alignment.BottomStart)
+                            .padding(12.dp)
+                    ) {
+                        Text(
+                            "Optimize ediliyor: $done / $total",
+                            fontSize = 11.sp,
+                            color = Color(0xFFE4E4E7),
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
+                        )
                     }
                 }
 
