@@ -45,6 +45,11 @@ data class PdfSearchHit(
     val rectVirtual: RectF?
 )
 
+data class PdfSecurityReport(
+    val isSafe: Boolean,
+    val findings: List<String>
+)
+
 data class PdfMeta(
     val pageCount: Int,
     val ratios: List<Float>,
@@ -70,6 +75,61 @@ object PdfLiteEngine {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) Bitmap.CompressFormat.WEBP_LOSSY
         else @Suppress("DEPRECATION") Bitmap.CompressFormat.WEBP
 
+    private fun hasPdfMagicHeader(file: File): Boolean {
+        return try {
+            FileInputStream(file).use { fis ->
+                val head = ByteArray(1024)
+                val n = fis.read(head)
+                if (n <= 4) return false
+                val str = String(head, 0, n, Charsets.ISO_8859_1)
+                str.contains("%PDF-")
+            }
+        } catch (_: Exception) { false }
+    }
+
+    /**
+     * Scans the PDF byte stream in bounded chunks for active/risky PDF tags
+     * (/JavaScript, /JS, /Launch, /OpenAction, /AA, /EmbeddedFile, /RichMedia, /SubmitForm).
+     * Note: PdfRenderer renders purely to bitmaps and never executes scripts or actions.
+     */
+    fun scanPdfSecurity(pdfPath: String): PdfSecurityReport {
+        val file = File(pdfPath)
+        if (!file.exists()) return PdfSecurityReport(false, listOf("Dosya bulunamadı"))
+        val triggers = linkedMapOf(
+            "/JavaScript" to "Gömülü JavaScript (/JavaScript)",
+            "/JS" to "Kısa JavaScript (/JS)",
+            "/Launch" to "Harici Program Başlatma (/Launch)",
+            "/OpenAction" to "Açılışta Otomatik Eylem (/OpenAction)",
+            "/AA" to "Otomatik Tetikleyici (/AA)",
+            "/EmbeddedFile" to "Gömülü Dosya (/EmbeddedFile)",
+            "/RichMedia" to "Zengin Medya/Flash (/RichMedia)",
+            "/SubmitForm" to "Veri Gönderme Formu (/SubmitForm)"
+        )
+        val found = linkedSetOf<String>()
+        try {
+            FileInputStream(file).use { fis ->
+                val buf = ByteArray(65536)
+                var overlap = ""
+                var scanned = 0L
+                val maxScan = 25L * 1024L * 1024L
+                while (scanned < maxScan) {
+                    val r = fis.read(buf)
+                    if (r <= 0) break
+                    scanned += r
+                    val chunk = overlap + String(buf, 0, r, Charsets.ISO_8859_1)
+                    triggers.forEach { (tag, label) ->
+                        if (label !in found && Regex(Regex.escape(tag) + "(?![A-Za-z0-9])").containsMatchIn(chunk)) {
+                            found.add(label)
+                        }
+                    }
+                    overlap = if (chunk.length > 32) chunk.takeLast(32) else chunk
+                    if (found.size == triggers.size) break
+                }
+            }
+        } catch (_: Exception) {}
+        return PdfSecurityReport(isSafe = found.isEmpty(), findings = found.toList())
+    }
+
     fun getDisplayName(context: Context, uri: Uri): String {
         var name: String? = null
         try {
@@ -81,7 +141,8 @@ object PdfLiteEngine {
             }
         } catch (_: Exception) {}
         if (name.isNullOrBlank()) name = uri.lastPathSegment?.substringAfterLast('/')
-        return (name ?: "Belge").substringBeforeLast('.').ifBlank { "Belge" }
+        val clean = (name ?: "Belge").substringBeforeLast('.').replace(Regex("[\\\\/:*?\"<>|\\p{Cntrl}]"), "_")
+        return clean.ifBlank { "Belge" }
     }
 
     /**
@@ -108,7 +169,7 @@ object PdfLiteEngine {
                 }
             } ?: return null
 
-            if (totalBytes <= 0L) {
+            if (totalBytes <= 8L || totalBytes > 300L * 1024L * 1024L || !hasPdfMagicHeader(tmp)) {
                 tmp.delete()
                 return null
             }
@@ -213,7 +274,7 @@ object PdfLiteEngine {
                     if (pageIdx !in 0 until renderer.pageCount) return null
                     renderer.openPage(pageIdx).use { page ->
                         val scale = targetWidth.toFloat() / page.width.coerceAtLeast(1)
-                        val h = (page.height * scale).toInt().coerceAtLeast(1)
+                        val h = (page.height * scale).toInt().coerceIn(1, 4096)
                         val bmp = Bitmap.createBitmap(targetWidth, h, Bitmap.Config.ARGB_8888)
                         bmp.eraseColor(Color.WHITE)
                         page.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
@@ -265,7 +326,7 @@ object PdfLiteEngine {
                         if (idx in 0 until renderer.pageCount) {
                             renderer.openPage(idx).use { page ->
                                 val scale = targetWidth.toFloat() / page.width.coerceAtLeast(1)
-                                val h = (page.height * scale).toInt().coerceAtLeast(1)
+                                val h = (page.height * scale).toInt().coerceIn(1, 4096)
                                 val bmp = if (reusableBmp != null && reusableBmp.width == targetWidth && reusableBmp.height == h) {
                                     reusableBmp
                                 } else {
@@ -432,7 +493,7 @@ object PdfLiteEngine {
                         renderer.openPage(i).use { page ->
                             val w = 1080
                             val scale = w.toFloat() / page.width.coerceAtLeast(1)
-                            val h = (page.height * scale).toInt().coerceAtLeast(1)
+                            val h = (page.height * scale).toInt().coerceIn(1, 4096)
                             val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
                             bmp.eraseColor(Color.WHITE)
                             page.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)

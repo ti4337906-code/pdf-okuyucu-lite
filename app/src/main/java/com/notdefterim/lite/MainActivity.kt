@@ -118,7 +118,7 @@ class MainActivity : ComponentActivity() {
                 recents = PdfLiteEngine.loadRecents(this@MainActivity)
                 openPdf = imported
             } else {
-                Toast.makeText(this@MainActivity, "PDF açılamadı", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this@MainActivity, "Geçersiz veya desteklenmeyen PDF reddedildi", Toast.LENGTH_LONG).show()
             }
             incomingPdfUri = null
         }
@@ -290,6 +290,8 @@ class MainActivity : ComponentActivity() {
         var resetZoomTrigger by remember { mutableIntStateOf(0) }
         var metaLoaded by remember(pdfPath) { mutableStateOf(false) }
         var optProgress by remember(pdfPath) { mutableStateOf<Pair<Int, Int>?>(null) }
+        var securityReport by remember(pdfPath) { mutableStateOf<PdfSecurityReport?>(null) }
+        var showSecurityDialog by remember { mutableStateOf(false) }
 
         LaunchedEffect(pdfPath) {
             val (meta, savedPage, savedStrokes) = withContext(Dispatchers.IO) {
@@ -298,6 +300,7 @@ class MainActivity : ComponentActivity() {
                 val st = PdfLiteEngine.loadStrokes(this@MainActivity, pdfPath)
                 Triple(m, lp, st)
             }
+            securityReport = withContext(Dispatchers.IO) { PdfLiteEngine.scanPdfSecurity(pdfPath) }
             pageCount = meta.pageCount
             splitEndStr = meta.pageCount.toString()
             pageRatios = meta.ratios
@@ -353,6 +356,51 @@ class MainActivity : ComponentActivity() {
                 }
             }
             if (changed) pageBitmaps = bmps
+        }
+
+        if (showSecurityDialog) {
+            val rep = securityReport
+            AlertDialog(
+                onDismissRequest = { showSecurityDialog = false },
+                containerColor = LITE_CARD,
+                title = {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Icon(
+                            imageVector = if (rep?.isSafe != false) Icons.Default.VerifiedUser else Icons.Default.Warning,
+                            contentDescription = null,
+                            tint = if (rep?.isSafe != false) Color(0xFF22C55E) else Color(0xFFF59E0B)
+                        )
+                        Text(
+                            if (rep?.isSafe != false) "Güvenli PDF" else "Riskli Etiket Tespit Edildi",
+                            color = Color.White,
+                            fontSize = 16.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                },
+                text = {
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        if (rep == null || rep.isSafe) {
+                            Text("Dosya içinde gömülü JavaScript, otomatik çalıştırma (/OpenAction, /Launch) veya gizli ek bulunmadı.", fontSize = 13.sp, color = Color(0xFFD4D4D8))
+                        } else {
+                            Text("Bu PDF içinde şu aktif bileşenler tespit edildi:", fontSize = 13.sp, color = Color(0xFFFDE68A))
+                            rep.findings.forEach { f ->
+                                Text("• $f", fontSize = 12.sp, color = Color.White)
+                            }
+                        }
+                        Text(
+                            "İzole Koruma Aktif: Uygulamanın internet izni yoktur, betik/WebView motoru içermez ve sayfaları yalnızca piksel görüntüsü olarak işler.",
+                            fontSize = 12.sp,
+                            color = Color(0xFFA1A1AA)
+                        )
+                    }
+                },
+                confirmButton = {
+                    TextButton(onClick = { showSecurityDialog = false }) {
+                        Text("Tamam", color = HONOR_BLUE, fontWeight = FontWeight.Bold)
+                    }
+                }
+            )
         }
 
         if (showSplitDialog) {
@@ -421,6 +469,15 @@ class MainActivity : ComponentActivity() {
                         Text(title, fontSize = 16.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
                     },
                     actions = {
+                        securityReport?.let { rep ->
+                            IconButton(onClick = { showSecurityDialog = true }) {
+                                Icon(
+                                    imageVector = if (rep.isSafe) Icons.Default.VerifiedUser else Icons.Default.Warning,
+                                    contentDescription = "Güvenlik Raporu",
+                                    tint = if (rep.isSafe) Color(0xFF22C55E) else Color(0xFFF59E0B)
+                                )
+                            }
+                        }
                         IconButton(onClick = {
                             showSearchBar = !showSearchBar
                             if (!showSearchBar) {
