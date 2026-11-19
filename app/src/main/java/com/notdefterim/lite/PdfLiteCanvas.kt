@@ -99,12 +99,14 @@ class PdfReaderView(context: Context) : View(context) {
     private val activePath = Path()
     private var activeDrawPage = 0
 
+    // Ergonomic Night Mode: matte charcoal (#11110F) background + warm off-white (#E0DACC) text
+    // Reduces blue-light glare and prevents white-on-black halation during long night reading
     private val invertPaint = Paint().apply {
         colorFilter = ColorMatrixColorFilter(
             floatArrayOf(
-                -1f, 0f, 0f, 0f, 255f,
-                0f, -1f, 0f, 0f, 255f,
-                0f, 0f, -1f, 0f, 255f,
+                -0.81f, 0f, 0f, 0f, 224f,
+                0f, -0.79f, 0f, 0f, 218f,
+                0f, 0f, -0.74f, 0f, 204f,
                 0f, 0f, 0f, 1f, 0f
             )
         )
